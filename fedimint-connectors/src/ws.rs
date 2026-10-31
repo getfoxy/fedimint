@@ -27,11 +27,21 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct WebsocketConnector {}
+pub struct WebsocketConnector {
+    /// When set, every WebSocket is opened through this SOCKS5 proxy, with
+    /// the host name resolved by the proxy (SOCKS5 "domain name" address).
+    socks5: Option<std::net::SocketAddr>,
+}
 
 impl WebsocketConnector {
     pub fn new() -> Self {
-        Self {}
+        Self { socks5: None }
+    }
+
+    pub fn with_socks5(proxy: std::net::SocketAddr) -> Self {
+        Self {
+            socks5: Some(proxy),
+        }
     }
 
     async fn make_new_connection(
@@ -102,6 +112,11 @@ impl WebsocketConnector {
             }
         }
 
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(proxy) = self.socks5 {
+            return socks5_ws(proxy, url, client).await;
+        }
+
         let client = client
             .build(url.as_str())
             .await
@@ -109,6 +124,93 @@ impl WebsocketConnector {
 
         Ok(Arc::new(client))
     }
+}
+
+/// Open `url` through a SOCKS5 proxy, then TLS (for `wss`), then WebSocket.
+#[cfg(not(target_family = "wasm"))]
+async fn socks5_ws(
+    proxy: std::net::SocketAddr,
+    url: &SafeUrl,
+    client: WsClientBuilder,
+) -> ServerResult<Arc<WsClient>> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let conn_err = |e: String| ServerError::Connection(e.into());
+    let host = url
+        .host_str()
+        .ok_or_else(|| ServerError::InvalidEndpoint("Expected host str".into()))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| ServerError::InvalidEndpoint("Expected port number".into()))?;
+    if host.len() > 255 {
+        return Err(ServerError::InvalidEndpoint("Host name too long".into()));
+    }
+
+    trace!(target: LOG_NET_WS, %proxy, %host, port, "SOCKS5 connect");
+    let mut s = tokio::net::TcpStream::connect(proxy)
+        .await
+        .map_err(|e| conn_err(format!("SOCKS5 proxy {proxy}: {e}")))?;
+    // Greeting: version 5, one method, "no authentication".
+    s.write_all(&[5, 1, 0]).await.map_err(|e| conn_err(e.to_string()))?;
+    let mut reply = [0u8; 2];
+    s.read_exact(&mut reply).await.map_err(|e| conn_err(e.to_string()))?;
+    if reply != [5, 0] {
+        return Err(conn_err(format!("SOCKS5 greeting refused: {reply:?}")));
+    }
+    // CONNECT by domain name, so the proxy (Tor) does the name lookup.
+    let mut req = vec![5, 1, 0, 3, host.len() as u8];
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req).await.map_err(|e| conn_err(e.to_string()))?;
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head).await.map_err(|e| conn_err(e.to_string()))?;
+    if head[1] != 0 {
+        return Err(conn_err(format!("SOCKS5 connect to {host}:{port} failed, code {}", head[1])));
+    }
+    let skip = match head[3] {
+        1 => 4 + 2,
+        4 => 16 + 2,
+        3 => {
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await.map_err(|e| conn_err(e.to_string()))?;
+            usize::from(len[0]) + 2
+        }
+        other => return Err(conn_err(format!("SOCKS5 bad address type {other}"))),
+    };
+    let mut rest = vec![0u8; skip];
+    s.read_exact(&mut rest).await.map_err(|e| conn_err(e.to_string()))?;
+
+    let ws = match url.scheme() {
+        "ws" => client.build_with_stream(url.as_str(), s).await,
+        "wss" => {
+            use tokio_rustls::TlsConnector;
+            use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+            let mut roots = RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let tls = TlsConnector::from(Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ));
+            let name = rustls_pki_types::ServerName::try_from(host)
+                .map_err(|e| ServerError::InvalidEndpoint(e.into()))?;
+            let tls_stream = tls
+                .connect(name, s)
+                .await
+                .map_err(|e| conn_err(e.to_string()))?;
+            client.build_with_stream(url.as_str(), tls_stream).await
+        }
+        other => {
+            return Err(ServerError::InvalidEndpoint(
+                format!("Unsupported scheme: {other}").into(),
+            ));
+        }
+    }
+    .map_err(|e| conn_err(e.to_string()))?;
+    Ok(Arc::new(ws))
 }
 
 impl Default for WebsocketConnector {

@@ -116,6 +116,21 @@ pub struct ConnectorRegistryBuilder {
 
     // Enable HTTP
     http_enable: bool,
+
+    /// Send every connection through a local proxy (e.g. Tor). When set, no
+    /// connector opens a direct socket to the internet.
+    proxy: Option<ProxyConfig>,
+}
+
+/// Where the local proxy listens.
+///
+/// Tor offers both on one daemon: `SocksPort` (used for WebSockets) and
+/// `HTTPTunnelPort` (HTTP CONNECT, used by iroh relays, pkarr lookups and
+/// HTTP gateways, because iroh's relay client only speaks HTTP CONNECT).
+#[derive(Debug, Clone)]
+pub struct ProxyConfig {
+    pub socks5: SocketAddr,
+    pub http_connect: url::Url,
 }
 
 impl ConnectorRegistryBuilder {
@@ -195,9 +210,13 @@ impl ConnectorRegistryBuilder {
         if !self.iroh_enable {
             return Err(ConnectorError::NotEnabled { scheme: "iroh" });
         }
-        let connector =
-            iroh::IrohConnector::new(self.iroh_dns.clone(), self.iroh_pkarr_dht, path_change)
-                .await?;
+        let connector = iroh::IrohConnector::new(
+            self.iroh_dns.clone(),
+            self.iroh_pkarr_dht,
+            path_change,
+            self.proxy.as_ref().map(|p| p.http_connect.clone()),
+        )
+        .await?;
 
         Ok(Arc::new(connector) as DynConnector)
     }
@@ -205,6 +224,11 @@ impl ConnectorRegistryBuilder {
     pub async fn build_ws_connector(&self) -> Result<DynConnector, ConnectorError> {
         if !self.ws_enable {
             return Err(ConnectorError::NotEnabled { scheme: "ws" });
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(proxy) = &self.proxy {
+            return Ok(Arc::new(WebsocketConnector::with_socks5(proxy.socks5)) as DynConnector);
         }
 
         match self.ws_force_tor {
@@ -224,6 +248,13 @@ impl ConnectorRegistryBuilder {
     pub fn build_http_connector(&self) -> Result<DynConnector, ConnectorError> {
         if !self.http_enable {
             return Err(ConnectorError::NotEnabled { scheme: "http" });
+        }
+
+        if let Some(proxy) = &self.proxy {
+            return Ok(
+                Arc::new(crate::http::HttpConnector::with_proxy(&proxy.http_connect)?)
+                    as DynConnector,
+            );
         }
 
         Ok(Arc::new(crate::http::HttpConnector::default()) as DynConnector)
@@ -255,6 +286,14 @@ impl ConnectorRegistryBuilder {
     pub fn http(self, enable: bool) -> Self {
         Self {
             http_enable: enable,
+            ..self
+        }
+    }
+
+    /// Route every connector through a local proxy; see [`ProxyConfig`].
+    pub fn proxy(self, proxy: ProxyConfig) -> Self {
+        Self {
+            proxy: Some(proxy),
             ..self
         }
     }
@@ -361,6 +400,7 @@ impl ConnectorRegistry {
             http_enable: true,
 
             connection_overrides: BTreeMap::default(),
+            proxy: None,
         }
     }
 
@@ -377,6 +417,7 @@ impl ConnectorRegistry {
             http_enable: false,
 
             connection_overrides: BTreeMap::default(),
+            proxy: None,
         }
     }
 
@@ -393,6 +434,7 @@ impl ConnectorRegistry {
             http_enable: true,
 
             connection_overrides: BTreeMap::default(),
+            proxy: None,
         }
     }
 

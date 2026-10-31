@@ -134,8 +134,9 @@ impl IrohConnector {
         iroh_dns: Option<SafeUrl>,
         iroh_enable_dht: bool,
         path_change: Arc<watch::Sender<u64>>,
+        proxy: Option<url::Url>,
     ) -> Result<Self, ConnectorError> {
-        let mut s = Self::new_no_overrides(iroh_dns, iroh_enable_dht, path_change).await?;
+        let mut s = Self::new_no_overrides(iroh_dns, iroh_enable_dht, path_change, proxy).await?;
 
         // Overrides are `<node-id>=<socket-addr>` pairs: the node id is the key
         // and the value is a single direct address. iroh 1.0 no longer ships
@@ -160,10 +161,16 @@ impl IrohConnector {
         iroh_dns: Option<SafeUrl>,
         iroh_enable_dht: bool,
         path_change: Arc<watch::Sender<u64>>,
+        proxy: Option<url::Url>,
     ) -> Result<Self, ConnectorError> {
+        // Behind a proxy: relays only, reached by HTTP CONNECT; no DHT and no
+        // plain DNS lookups (they would bypass the proxy). Pkarr lookups are
+        // HTTPS and pick the proxy up from `HTTPS_PROXY`.
+        let iroh_enable_dht = iroh_enable_dht && proxy.is_none();
+        let proxy_next = proxy.clone();
         let endpoint_stable = Box::pin({
             let iroh_dns = iroh_dns.clone();
-            async {
+            async move {
                 let mut builder = Endpoint::builder();
 
                 if let Some(iroh_dns) = iroh_dns.map(SafeUrl::to_unsafe) {
@@ -172,6 +179,25 @@ impl IrohConnector {
 
                 // As a client, we don't need to register on any relays
                 let mut builder = builder.relay_mode(iroh::RelayMode::Disabled);
+
+                #[cfg(not(target_family = "wasm"))]
+                if let Some(proxy) = proxy.clone() {
+                    // iroh 0.35 cannot run without UDP sockets, so bind them to
+                    // loopback: a packet to any internet address fails in the
+                    // kernel instead of leaving the machine.
+                    builder = builder
+                        .proxy_url(proxy)
+                        .bind_addr_v4(std::net::SocketAddrV4::new(
+                            std::net::Ipv4Addr::LOCALHOST,
+                            0,
+                        ))
+                        .bind_addr_v6(std::net::SocketAddrV6::new(
+                            std::net::Ipv6Addr::LOCALHOST,
+                            0,
+                            0,
+                            0,
+                        ));
+                }
 
                 #[cfg(not(target_family = "wasm"))]
                 if iroh_enable_dht {
@@ -190,7 +216,9 @@ impl IrohConnector {
                         );
                     }
 
-                    if is_env_var_set_opt(FM_IROH_N0_DISCOVERY_ENABLE_ENV).unwrap_or(true) {
+                    if proxy.is_none()
+                        && is_env_var_set_opt(FM_IROH_N0_DISCOVERY_ENABLE_ENV).unwrap_or(true)
+                    {
                         #[cfg(not(target_family = "wasm"))]
                         {
                             builder = builder.add_discovery(move |_| {
@@ -234,6 +262,14 @@ impl IrohConnector {
             let mut builder = builder.relay_mode(iroh_next::RelayMode::Default);
 
             #[cfg(not(target_family = "wasm"))]
+            if let Some(proxy) = proxy_next.clone() {
+                builder = builder
+                    .proxy_url(proxy)
+                    .clear_ip_transports()
+                    .portmapper_config(iroh_next::endpoint::PortmapperConfig::Disabled);
+            }
+
+            #[cfg(not(target_family = "wasm"))]
             if iroh_enable_dht {
                 builder = builder
                     .address_lookup(iroh_mainline_address_lookup::DhtAddressLookup::builder());
@@ -247,7 +283,7 @@ impl IrohConnector {
                     builder.address_lookup(iroh_next::address_lookup::PkarrResolver::n0_dns());
                 // Resolve using DNS queries outside browsers.
                 #[cfg(not(target_family = "wasm"))]
-                {
+                if proxy_next.is_none() {
                     builder = builder
                         .address_lookup(iroh_next::address_lookup::DnsAddressLookup::n0_dns());
                 }

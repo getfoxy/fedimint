@@ -16,6 +16,22 @@ pub(crate) struct HttpConnector {
     client: Arc<reqwest::Client>,
 }
 
+impl HttpConnector {
+    /// All gateway HTTP requests go through `proxy` (HTTP CONNECT); the
+    /// gateway's host name is resolved by the proxy, not locally.
+    pub(crate) fn with_proxy(proxy: &url::Url) -> Result<Self, ConnectorError> {
+        let proxy = reqwest::Proxy::all(proxy.as_str())
+            .map_err(|err| ConnectorError::Transport(err.into()))?;
+        let client = reqwest::Client::builder()
+            .proxy(proxy)
+            .build()
+            .map_err(|err| ConnectorError::Transport(err.into()))?;
+        Ok(Self {
+            client: Arc::new(client),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::Connector for HttpConnector {
     async fn connect_guardian(
